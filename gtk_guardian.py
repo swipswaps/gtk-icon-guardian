@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-GTK Icon Guardian – Fully Automated Fix
+GTK Icon Guardian – Fully Automated Fix with Alert on Failure
 - Finds the REAL image-missing.png (not the 1x1 transparent)
-- Installs boot-time restore, watchdog monitor, and auditd (if possible)
-- No manual steps required.
+- Installs boot-time restore, watchdog monitor, auditd, and daily timers
+- Adds a periodic check that sends alerts if restoration fails
+- Copies itself to /usr/local/bin so timers work
 """
-import os, sys, subprocess, shutil, time, hashlib, traceback, tempfile
+import os, sys, subprocess, shutil, time, hashlib, traceback, tempfile, argparse
 from pathlib import Path
 
 BACKUP_DIR = Path("/usr/local/lib/gtk-icon-backup")
@@ -16,6 +17,10 @@ WATCH_DIRS = []
 for theme in ["Adwaita", "hicolor"]:
     for size in ["16x16", "24x24", "32x32", "48x48", "scalable"]:
         WATCH_DIRS.append(Path(f"/usr/share/icons/{theme}/{size}/status"))
+
+# Paths used by the boot restore script
+RESTORE_SCRIPT = Path("/usr/local/bin/gtk-icon-boot-restore.sh")
+ICON_PATH = Path("/usr/share/icons/Adwaita/16x16/status/image-missing.png")
 
 def log(msg, detail=""):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -411,9 +416,91 @@ ExecStart=/usr/local/bin/gtk-icon-healthcheck.sh
     run_cmd("systemctl start gtk-icon-healthcheck.timer", check=True)
     log("✅ Daily health check timer installed.")
 
+# ------------------------------------------------------------------
+# Check & Alert Function
+# ------------------------------------------------------------------
+def check_and_alert():
+    """One‑time check: if icon missing, try to restore; if restoration fails, send alert."""
+    log("🔍 Running periodic check...")
+    if ICON_PATH.exists():
+        log("✅ Icon is present.")
+        return 0
+
+    log("⚠️ Icon is missing – attempting restore.")
+    if RESTORE_SCRIPT.exists() and os.access(RESTORE_SCRIPT, os.X_OK):
+        ret = subprocess.run([str(RESTORE_SCRIPT)], capture_output=True)
+        if ret.returncode == 0 and ICON_PATH.exists():
+            log("✅ Restore succeeded.")
+            return 0
+        else:
+            log("❌ Restore failed.")
+    else:
+        log("❌ Restore script not found or not executable.")
+
+    msg = "⚠️ GTK icon is MISSING and could NOT be restored! Run: sudo /usr/local/bin/gtk-icon-boot-restore.sh"
+    log(msg)
+    subprocess.run(["wall", msg])
+    display = os.environ.get("DISPLAY")
+    if display and shutil.which("notify-send"):
+        try:
+            subprocess.run(["notify-send", "-u", "critical", "GTK Icon Crisis", msg], env={**os.environ, "DISPLAY": display})
+        except:
+            pass
+    log("⚠️ Alert sent.")
+    return 1
+
+# ------------------------------------------------------------------
+# Install self‑copy and periodic check timer
+# ------------------------------------------------------------------
+def install_self():
+    """Copy this script to /usr/local/bin so the timer can find it."""
+    target = Path("/usr/local/bin/gtk_guardian.py")
+    if target.exists():
+        log(f"✅ Self‑install already present: {target}")
+        return
+    try:
+        shutil.copy2(__file__, target)
+        target.chmod(0o755)
+        log(f"✅ Self‑installed to {target}")
+    except Exception as e:
+        log(f"⚠️ Could not self‑install: {e}")
+
+def install_check_timer():
+    log("[7] Installing periodic check timer (every 5 minutes)...")
+    service_content = """[Unit]
+Description=GTK Icon Check & Alert
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gtk_guardian.py --check
+"""
+    timer_content = """[Unit]
+Description=Check GTK icon every 5 minutes
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+[Install]
+WantedBy=timers.target
+"""
+    Path("/etc/systemd/system/gtk-icon-check.service").write_text(service_content)
+    Path("/etc/systemd/system/gtk-icon-check.timer").write_text(timer_content)
+    run_cmd("systemctl daemon-reload", check=True)
+    run_cmd("systemctl enable gtk-icon-check.timer", check=True)
+    run_cmd("systemctl start gtk-icon-check.timer", check=True)
+    log("✅ Periodic check timer installed and enabled.")
+
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
 def main():
+    parser = argparse.ArgumentParser(description="GTK Icon Guardian")
+    parser.add_argument("--check", action="store_true", help="Run a one-time check and alert if restoration fails")
+    args = parser.parse_args()
+
+    if args.check:
+        sys.exit(check_and_alert())
+
     print("="*80)
-    print("  GTK Icon Guardian – Fully Automated Fix")
+    print("  GTK Icon Guardian – Fully Automated Fix with Alert")
     print("="*80)
     restore_icons()
     create_backup()
@@ -423,17 +510,22 @@ def main():
     create_boot_restore_service()
     install_watchdog_service()
     install_daily_timer()
+    install_self()            # <-- self‑install before the timer
+    install_check_timer()
     print("\n" + "="*80)
     print("✅ Setup complete!")
     print("   - Real icon restored (even if package provides 1x1)")
     print("   - Boot-time restore service enabled")
     print("   - Watchdog monitor running")
     print("   - Daily health check timer active")
+    print("   - Periodic check timer (every 5 min) with alert on failure")
     print("   - auditd is set up if possible (otherwise skipped)")
     print("\n📋 To see restore logs:")
     print("   sudo tail -f /var/log/gtk-icon-restore.log")
     print("📋 To see deletion forensics (if auditd works):")
     print("   sudo ausearch -k gtk-icon-watch -ts today")
+    print("📋 Manual check command:")
+    print("   sudo /usr/local/bin/gtk_guardian.py --check")
     print("="*80)
 
 if __name__ == "__main__":
